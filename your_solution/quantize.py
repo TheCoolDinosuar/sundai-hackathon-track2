@@ -1,19 +1,15 @@
-"""Offline weight quantization -- YOUR SOLUTION.
+"""Offline weight quantization with a tiled scale layout.
 
-Modify this file to implement your own quantization strategy.
-The standard implementation uses round-to-nearest symmetric INT4
-with group_size=64. You may change the algorithm or the group_size, as long as:
-  1. The function signature stays the same.
-  2. The output format is compatible with your CUDA gemm_int4 kernel.
-  3. The end-to-end result passes the cosine similarity threshold (>0.98).
-
-The packed format convention:
-  - Two signed INT4 values per uint8 byte
-  - Low nibble = even element, high nibble = odd element
-  - Scales are FP16, one per group
+Weights stay row-major packed so the benchmark still sees the correct `N`
+dimension, but the per-group scales are pre-arranged in 128-column tiles to
+make the runtime kernel's scale fetches cheaper.
 """
 
 import torch
+
+
+BLOCK_N = 128
+BLOCK_K = 64
 
 
 def quantize_weights(weight: torch.Tensor, group_size: int = 64) -> dict:
@@ -26,7 +22,8 @@ def quantize_weights(weight: torch.Tensor, group_size: int = 64) -> dict:
     Returns:
         dict with:
             "weight_packed": [N, K//2] uint8 tensor (packed INT4)
-            "weight_scales": [N, K//group_size] float16 tensor (per-group scales)
+            "weight_scales": either [N, K//group_size] or
+                [N//128, K//group_size, 128] float16 tensor
             "group_size": int
     """
     assert weight.dim() == 2, "weight must be 2D [N, K]"
@@ -36,24 +33,36 @@ def quantize_weights(weight: torch.Tensor, group_size: int = 64) -> dict:
 
     num_groups = K // group_size
 
-    # Work in float32 for precision
+    # Work in float32 for stable scale selection.
     w = weight.float().reshape(N, num_groups, group_size)
 
-    # Per-group symmetric scale: scale = max(|x|) / 7
-    max_abs = w.abs().amax(dim=-1, keepdim=True)  # [N, num_groups, 1]
-    scale = max_abs / 7.0
-    rscale = torch.where(max_abs > 0, 7.0 / max_abs, torch.zeros_like(max_abs))
+    # Mild percentile clipping preserves accuracy on outlier-heavy rows while
+    # keeping the runtime format compatible with the symmetric INT4 kernel.
+    abs_w = w.abs()
+    clip = torch.quantile(abs_w, 0.992, dim=-1, keepdim=True)
+    max_abs = abs_w.amax(dim=-1, keepdim=True)
+    scale_base = torch.minimum(max_abs, clip * 1.05)
+    scale = torch.where(scale_base > 0, scale_base / 7.0, torch.zeros_like(scale_base))
+    rscale = torch.where(scale_base > 0, 7.0 / scale_base, torch.zeros_like(scale_base))
 
-    # Quantize: round to nearest, clamp to [-8, 7]
-    q = (w * rscale).round().clamp(-8, 7).to(torch.int8)  # [N, num_groups, group_size]
+    q = (w * rscale).round().clamp(-8, 7).to(torch.int8)
+
     q = q.reshape(N, K)
-
-    # Pack two INT4 values per byte: low nibble = even, high nibble = odd
     even = (q[:, 0::2] & 0xF).to(torch.uint8)
     odd = ((q[:, 1::2] & 0xF) << 4).to(torch.uint8)
-    packed = odd | even  # [N, K//2]
+    packed = (odd | even).contiguous()
 
-    scales = scale.squeeze(-1).half()  # [N, num_groups]
+    if group_size == BLOCK_K and N % BLOCK_N == 0:
+        n_tiles = N // BLOCK_N
+        scales = (
+            scale.squeeze(-1)
+            .reshape(n_tiles, BLOCK_N, num_groups)
+            .permute(0, 2, 1)
+            .contiguous()
+            .half()
+        )
+    else:
+        scales = scale.squeeze(-1).half()
 
     return {
         "weight_packed": packed,
